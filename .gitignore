@@ -1,0 +1,271 @@
+
+# load R packages
+library(ncvreg)
+library(survival)
+library(ggm)
+library(MASS)
+library(ivtools)
+
+
+# SIS for alpha
+sis_alpha <- function(X, M, COV){
+  s_alpha <- function(j){
+    if (is.null(COV)) {
+      MX <- data.frame(M = M[, j], X = X)
+    } else {
+      MX <- data.frame(M = M[, j], X = X, COV = COV)
+    }
+    fit <- glm(M ~., data = MX)
+    s1 <- summary(fit)$cov.scaled[2,2]   #var for alpha
+    s2 <- summary(fit)$coef[2]           #coefficients for alpha
+    s3 <- summary(fit)$coef[2,4]         #p-value for alpha
+    return(data.frame(s_var=s1, s_coef=s2, s_p=s3))
+  }
+  dat=data.frame(do.call(rbind, lapply(1:ncol(M), s_alpha)))
+  alpha_sis <- t(dat)
+  colnames(alpha_sis) = colnames(M)
+  return(s_alpha=alpha_sis)
+}
+
+
+# SIS for beta
+sis_beta <- function(X, M, Y, COV){
+  s_beta <- function(j){
+    if (is.null(COV)) {
+      MX <- data.frame(Y=Y, M = M[, j], X = X)
+    } else {
+      MX <- data.frame(Y=Y, M = M[, j], X = X, COV = COV)
+    }
+    fit <- coxph(Y ~., data = MX)
+    s1 <- fit$var[1,1]   #var for beta
+    s2 <- summary(fit)$coef[1]           #coefficients for beta
+    s3 <- summary(fit)$coef[1,5]         #p-value for beta
+    return(data.frame(s_var=s1, s_coef=s2, s_p=s3))
+  }
+  dat=data.frame(do.call(rbind, lapply(1:ncol(M), s_beta)))
+  beta_sis <- t(dat)
+  colnames(beta_sis) = colnames(M)
+  return(s_beta=beta_sis)
+}
+
+
+# ncvreg:X ~ M_SIS
+selection <- function(X, M_SIS, Y, COV, ID_SIS, penalty) {
+  # ----------- step 2 penalty-based variable selection ----------- #
+  
+  if (is.null(COV)) {
+    fit <- ncvreg(M_SIS, X, family="binomial",
+                  penalty = penalty, 
+                  penalty.factor = rep(1, ncol(M_SIS)))
+  } else {
+    COV <- data.frame(COV)
+    COV <- data.frame(model.matrix(~., COV))[, -1,drop=F]
+    conf.names <- colnames(COV)
+    M_COV <- cbind(M_SIS, COV)
+    fit <- ncvreg(M_COV, X, family="binomial",
+                  penalty = penalty, 
+                  penalty.factor = c(rep(1, ncol(M_SIS)), rep(0, ncol(COV))))
+  }
+  
+  lam <- fit$lambda[which.min(BIC(fit))]
+
+  Coefficients <- coef(fit, lambda = lam)
+  est <- Coefficients[2:length(ID_SIS)+1]
+  ID_p_non <- which(est != 0)
+
+  beta_p <- est[ID_p_non]  # The non-zero MCP estimators of beta
+  ID_p <- ID_SIS[ID_p_non]  # The index of the ID of non-zero beta in the logistics regression
+  MCP_M <- names(ID_p_non)
+  return(M_SIS[,MCP_M])
+}
+# undebug(selection)
+
+
+cal_betaIV <- function(X, sub_M, Y, COV, Z) {
+  YMXZ <- data.frame(Y = Y, sub_M, X, COV, Z)
+  # regression:X~Z
+  formula1 <- as.formula(paste("X ~ ", paste(colnames(Z), collapse = "+")))
+  fitX.LZ <- glm(formula1, family = 'binomial', data = YMXZ)
+  # regrssion:Y~.-Z
+  varlist <- c(colnames(sub_M), "X",colnames(COV))
+  formula2 <- as.formula(paste("Y ~ ", paste(varlist, collapse = "+")))
+  fitT.LX <- coxph(formula2 , data = YMXZ)
+  # IV method: X+M+COV-->Y
+  fit_YMX <- ivcoxph(estmethod = 'ts', fitX.LZ = fitX.LZ, 
+                     fitT.LX = fitT.LX, data = YMXZ)
+  summary(fit_YMX)
+  beta_coef <- fit_YMX$est[1:ncol(sub_M)]
+  beta_var <- diag(fit_YMX$vcov)[1:ncol(sub_M)]
+  beta_pvalue <- summary(fit_YMX)$coef[1:ncol(sub_M),4]
+  beta <- rbind(beta_var, beta_coef, beta_pvalue)
+  return(beta)
+}
+
+
+#main function
+hmas <- function(X, Y, M, COV = NULL, 
+                 penalty = c("MCP", "SCAD", "lasso"), 
+                 path = c('MX', 'MY'),
+                 topN = NULL) {
+  penalty <- match.arg(penalty)
+  path <- match.arg(path)
+  
+  n <- nrow(M)
+  p <- ncol(M)
+  # ----------- step 1.1 Sure Independence Screening ----------- #
+  if (is.null(topN)) {
+    d <- ceiling(3*n/log(n))  #the top d mediators that associated with exposure 
+  } else {
+    d <- topN  
+  }
+  
+  if (path == 'MY'){
+    beta_s <- sis_beta1(X=X, M=M, Y=Y, COV=COV)
+    SIS_beta <- beta_s[3,]
+    SIS_beta_sort <- sort(SIS_beta)
+    ID_SIS <- which(SIS_beta <= SIS_beta_sort[d])  # the index of top d significant mediators (Y~X+M)
+  }else{
+    alpha_s <- sis_alpha(X, M, COV)
+    SIS_alpha <- alpha_s[3,]
+    SIS_alpha_sort <- sort(SIS_alpha)
+    ID_SIS <- which(SIS_alpha <= SIS_alpha_sort[d])  # the index of top d significant mediators (M~X)
+  }
+  M_SIS <- M[, ID_SIS]
+  
+  # ----------- step 2 penalty-based variable selection ----------- #
+  XM <- cbind(M_SIS, X)
+  if (is.null(COV)) {
+    fit <- ncvsurv(XM, Y, 
+                   penalty = penalty, 
+                   penalty.factor = c(rep(1, ncol(M_SIS)), 0))
+  } else {
+    COV <- data.frame(COV)
+    COV <- data.frame(model.matrix(~., COV))[, -1,drop=F]
+    conf.names <- colnames(COV)
+    XM_COV <- cbind(XM, COV)
+    fit <- ncvsurv(XM_COV, Y, 
+                   penalty = penalty, 
+                   penalty.factor = c(rep(1, ncol(M_SIS)), rep(0, 1 + ncol(COV))))
+  }
+  lam <- fit$lambda[which.min(BIC(fit))]
+  Coefficients <- coef(fit, lambda = lam)
+  est <- Coefficients[1:length(ID_SIS)]
+  ID_p_non <- which(est != 0)
+  beta_p <- est[ID_p_non]  # The non-zero MCP estimators of beta
+  ID_p <- ID_SIS[ID_p_non]  # The index of the ID of non-zero beta in the Cox regression
+  MCP_M <- names(ID_p_non)  
+  sub_M <- M[, MCP_M]      # potential mediators
+
+  # ----------- step 1.2 screen instrumental variables ----------- #
+  sub_M_X <- selection(X, M_SIS, Y, COV, ID_SIS, penalty="MCP") 
+  # delete potential mediator from sub_M_X
+  ID_IV <- setdiff(colnames(sub_M_X), colnames(sub_M))
+  Z <- M[, ID_IV]   # instrumental variables
+  
+  
+  # ----------- step 3 mediation test ----------- #
+  test_a <- sis_alpha(X, sub_M, COV)
+  test_b <- cal_betaIV(X, sub_M, Y, COV, Z)
+  alpha_est <- test_a[2,]
+  beta_est <- test_b[2,]
+  var_alpha <- test_a[1,]
+  var_beta <- test_b[1,]
+  
+  # sobel test
+  var_ab <- (alpha_est^2) * var_beta + (beta_est^2) * var_alpha
+  ab_est <- alpha_est * beta_est
+  # confidence interval
+  conf_low <- ab_est - 1.96 * sqrt(var_ab)
+  conf_up <- ab_est + 1.96 * sqrt(var_ab)
+  sobel.sta <- abs(ab_est)/sqrt(var_ab)   #z-score for sobel test
+  p_sobel <- 2 * (1-pnorm(sobel.sta))     #p-value of sobel test
+  P_bon_sobel <- p.adjust(p_sobel, "bonferroni", ncol(sub_M))  # "bonferroni" adjusted p-value
+  P_fdr_sobel <- p.adjust(p_sobel, "fdr", ncol(sub_M))  # "fdr" adjusted p-value
+  
+  # joint test
+  p_bon_alpha <- p.adjust(test_a[3,], "bonferroni", length(test_a[3,]))
+  p_bon_beta <- p.adjust(test_b[3,], "bonferroni", length(test_b[3,])) # "bonferroni" adjusted p-value
+  PB_bon <- rbind(p_bon_beta, p_bon_alpha)
+  P_bon_joint <- apply(PB_bon, 2, max)
+  p_fdr_alpha <- p.adjust(test_a[3,], "fdr", length(test_a[3,]))
+  p_fdr_beta <- p.adjust(test_b[3,], "fdr", length(test_b[3,])) # "bonferroni" adjusted p-value
+  PB_fdr <- rbind(p_fdr_beta, p_fdr_alpha)
+  P_fdr_joint <- apply(PB_fdr, 2, max)
+  
+  results <- data.frame(alpha = alpha_est, beta = beta_est,
+                        `alpha_est*beta_est` = ab_est,
+                        conf_low=conf_low, conf_up=conf_up,
+                        P_bon_sobel=P_bon_sobel, P_fdr_sobel=P_fdr_sobel,
+                        P_bon_joint=P_bon_joint, P_fdr_joint=P_fdr_joint,
+                        var_ab=var_ab, var_alpha=var_alpha, var_beta=var_beta,
+                        check.names = FALSE)
+  
+  return(list(MCP_M, ID_IV, results))
+}
+
+
+
+load(file='data/duty1.RData')
+load(file='data/DNAmethylation450.RData')
+
+# undebug(hmas) 
+hhh <- hmas(X, Y, M, COV, penalty = "MCP", path = 'MX')
+hhh[3] 
+
+
+sub_M <- Med
+
+# ========== bootstrap ========== #
+# bootstrap p value when rep.=1000
+ppp <- function(dat) {
+  for (i in seq(0,0.5,0.001)) {
+    dd = quantile(dat, probs = c(i/2, 1-i/2))
+    if(dd[1]*dd[2] >= 0){
+      p.value <- i
+      break
+    }
+  }
+  return(p.value)
+}
+### bootstrap sampling
+bootstrap_test <- function(i, X, M, Y, COV, Z) {
+  set.seed(i)
+  YMXZ <- data.frame(M, COV, Z, Y, X)
+  ID <- sample(1:nrow(YMXZ), replace = TRUE) 
+  data <- YMXZ[ID, ]
+  X <- data$X
+  Y <- data$Y
+  M <- data[,1:ncol(M)]
+  COV <- data[,(ncol(M)+1):(ncol(M)+ncol(COV))]
+  Z <-  data[,(ncol(M)+ncol(COV)+1):(ncol(M)+ncol(COV)+ncol(Z))]
+  alpha <- sis_alpha(X, M, COV)
+  beta <- cal_betaIV(X, M, Y, COV, Z)
+  ab <- alpha[2,] * beta[2,]
+  return(ab)
+}
+bootstrap_test(1, X, Med, Y, COV, Z)
+
+library(foreach)
+library(doParallel)
+
+cl <- makeCluster(10)
+registerDoParallel(cl)
+
+hhh <- foreach(i = 1:1250, .combine = rbind,
+               .errorhandling = "remove", 
+               .packages = c("survival","boot","ivtools"),
+               .export = c("bootstrap_test","cal_betaIV","sis_alpha",
+                           "X", "sub_M", "Y", "COV", "Z")) %dopar% {
+                             bootstrap_test(i, X, sub_M, Y, COV, Z)}
+stopImplicitCluster()
+stopCluster(cl)
+
+boot_ci <- t(apply(hhh, 2, function(x) {
+  out <- quantile(x,probs = c(0.025, 0.975));pvalue <- ppp(x);
+  return(c(lower=unname(out[1]), upper=unname(out[2]), 
+           pvalue=pvalue))}))
+boot_ci
+
+
+
+
